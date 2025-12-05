@@ -1,0 +1,157 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/*
+  XLON 12-Month Native Staking Pool (Remix demo)
+
+  - Users stake XLON (native coin) for 12 months.
+  - Fixed reward at entry (rate in basis points, e.g., 800 = 8%).
+  - Rewards are prefunded in XLON (no minting).
+  - One active stake per wallet. No early exit.
+  - Claim principal + reward after 12 months.
+  - Admin: deposit rewards, change rate for NEW stakes, pause/unpause.
+  - Staking entry:
+      * via stake() payable
+      * via direct XLON transfer (receive())
+*/
+
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.5/contracts/access/Ownable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.5/contracts/security/Pausable.sol";
+import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/v4.9.5/contracts/security/ReentrancyGuard.sol";
+
+contract XlonStaking12M is Ownable, Pausable, ReentrancyGuard {
+    // --- config ---
+    uint256 public constant LOCK_DURATION = 365 days; // 12 months
+    uint256 public rateBps; // reward rate in basis points, e.g. 800 = 8.00%
+
+    // --- accounting ---
+    uint256 public totalStaked;
+    uint256 public totalRewardsReserved;
+
+    struct Position {
+        uint256 amountStaked;
+        uint256 rewardLocked;
+        uint256 startTime;
+        uint256 unlockTime;
+        bool claimed;
+    }
+
+    mapping(address => Position) public positions;
+
+    // --- events ---
+    event RewardsDeposited(address indexed from, uint256 amount, uint256 poolBalance);
+    event RateUpdated(uint256 oldRateBps, uint256 newRateBps);
+    event Staked(address indexed user, uint256 amount, uint256 rewardLocked, uint256 start, uint256 unlock);
+    event Claimed(address indexed user, uint256 principal, uint256 reward);
+
+    constructor(uint256 initialRateBps) Ownable() {
+        rateBps = initialRateBps; // e.g. 800 => 8%
+    }
+
+    // -------- admin --------
+
+    /// @notice Prefund rewards (send native XLON with this call).
+    function depositRewards() external payable onlyOwner {
+        require(msg.value > 0, "No value");
+        emit RewardsDeposited(msg.sender, msg.value, address(this).balance);
+    }
+
+    /// @notice Update reward rate (applies only to new stakes).
+    function setRateBps(uint256 newRateBps) external onlyOwner {
+        emit RateUpdated(rateBps, newRateBps);
+        rateBps = newRateBps;
+    }
+
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
+
+    // -------- staking (two entry paths) --------
+
+    /// @notice Stake by calling this function and sending XLON (msg.value).
+    function stake() external payable nonReentrant whenNotPaused {
+        _stake(msg.sender, msg.value);
+    }
+
+    /// @notice Stake by sending XLON directly to the contract address.
+    receive() external payable {
+        _stake(msg.sender, msg.value);
+    }
+
+    function _stake(address user, uint256 amount) internal {
+        require(amount > 0, "Amount=0");
+
+        Position storage p = positions[user];
+        require(p.amountStaked == 0 || p.claimed, "Already staked");
+
+        // Fixed reward at entry: amount * rateBps / 10_000
+        uint256 reward = (amount * rateBps) / 10_000;
+
+        // Ensure rewards are prefunded:
+        // current balance already includes `amount`
+        uint256 availableRewards = address(this).balance
+            - (totalStaked + amount)   // all principals including this one
+            - totalRewardsReserved;    // rewards already reserved
+
+        require(availableRewards >= reward, "Insufficient prefunded rewards");
+
+        p.amountStaked = amount;
+        p.rewardLocked = reward;
+        p.startTime = block.timestamp;
+        p.unlockTime = block.timestamp + LOCK_DURATION;
+        p.claimed = false;
+
+        totalStaked += amount;
+        totalRewardsReserved += reward;
+
+        emit Staked(user, amount, reward, p.startTime, p.unlockTime);
+    }
+
+    // -------- claim --------
+
+    /// @notice Claim principal + reward after lock duration.
+    function claim() external nonReentrant {
+        Position storage p = positions[msg.sender];
+        require(!p.claimed, "Already claimed");
+        require(p.amountStaked > 0, "No stake");
+        require(block.timestamp >= p.unlockTime, "Not matured");
+
+        uint256 principal = p.amountStaked;
+        uint256 reward = p.rewardLocked;
+
+        p.claimed = true;
+        totalStaked -= principal;
+        totalRewardsReserved -= reward;
+
+        (bool ok, ) = payable(msg.sender).call{value: principal + reward}("");
+        require(ok, "Payout failed");
+
+        emit Claimed(msg.sender, principal, reward);
+
+        delete positions[msg.sender]; // optional cleanup
+    }
+
+    // -------- views --------
+
+    function positionOf(address user) external view returns (
+        uint256 amountStaked,
+        uint256 rewardLocked,
+        uint256 startTime,
+        uint256 unlockTime,
+        bool claimed
+    ) {
+        Position memory p = positions[user];
+        return (p.amountStaked, p.rewardLocked, p.startTime, p.unlockTime, p.claimed);
+    }
+
+    function timeToUnlock(address user) external view returns (uint256) {
+        Position memory p = positions[user];
+        if (block.timestamp >= p.unlockTime) return 0;
+        return p.unlockTime - block.timestamp;
+    }
+
+    /// @notice Rewards currently free to be reserved for new stakes.
+    function availableRewardsNow() external view returns (uint256) {
+        if (address(this).balance <= totalStaked + totalRewardsReserved) return 0;
+        return address(this).balance - totalStaked - totalRewardsReserved;
+    }
+}
